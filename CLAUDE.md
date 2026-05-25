@@ -10,6 +10,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 See `/tequila-mule-PRD.md` (or the PRD passed at init time) for full requirements.
 
+## Agent Skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical labels track issue state: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
 ## Project Structure
 
 ```
