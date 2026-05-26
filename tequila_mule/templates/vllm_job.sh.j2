@@ -1,0 +1,96 @@
+#!/bin/bash
+#SBATCH --partition={{ partition }}
+#SBATCH --gres={{ gres }}
+#SBATCH --time={{ wall_time }}
+#SBATCH --job-name=tequila-mule-vllm
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
+
+set -euo pipefail
+
+# Trap SIGTERM to gracefully deregister before job termination
+trap 'cleanup' TERM INT
+
+cleanup() {
+    echo "Received termination signal, cleaning up..."
+    # TODO: POST to gateway /internal/deregister
+    exit 0
+}
+
+echo "=== tequila-mule vLLM Job ==="
+echo "Job ID: $SLURM_JOB_ID"
+echo "Node: $(hostname)"
+echo "Started: $(date)"
+
+# vLLM server details
+VLLM_PORT="{{ vllm_port }}"
+VLLM_HOST="0.0.0.0"
+MODEL_NAME="{{ model_name }}"
+CONTAINER="{{ container_path }}"
+
+# Gateway registration details
+GATEWAY_HOST="{{ gateway_host }}"
+GATEWAY_PORT="{{ gateway_port }}"
+GATEWAY_URL="http://${GATEWAY_HOST}:${GATEWAY_PORT}"
+
+echo "Model: ${MODEL_NAME}"
+echo "Container: ${CONTAINER}"
+echo "vLLM will bind to ${VLLM_HOST}:${VLLM_PORT}"
+
+# Start vLLM server in Singularity container
+echo "Starting vLLM server..."
+singularity exec --nv "${CONTAINER}" \
+    vllm serve "${MODEL_NAME}" \
+    --host "${VLLM_HOST}" \
+    --port "${VLLM_PORT}" \
+    {{ vllm_extra_args }} &
+
+VLLM_PID=$!
+echo "vLLM PID: ${VLLM_PID}"
+
+# Wait for vLLM to be ready (check /health endpoint)
+echo "Waiting for vLLM to be ready..."
+MAX_WAIT=300  # 5 minutes
+ELAPSED=0
+while [ $ELAPSED -lt $MAX_WAIT ]; do
+    if curl -s http://localhost:${VLLM_PORT}/health > /dev/null 2>&1; then
+        echo "vLLM is ready!"
+        break
+    fi
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+done
+
+if [ $ELAPSED -ge $MAX_WAIT ]; then
+    echo "ERROR: vLLM failed to start within ${MAX_WAIT} seconds"
+    kill $VLLM_PID 2>/dev/null || true
+    exit 1
+fi
+
+# Register with gateway
+NODE=$(hostname)
+echo "Registering with gateway at ${GATEWAY_URL}"
+REGISTER_PAYLOAD=$(cat <<EOF
+{
+  "job_id": "${SLURM_JOB_ID}",
+  "node": "${NODE}",
+  "port": ${VLLM_PORT}
+}
+EOF
+)
+
+curl -X POST \
+    -H "Content-Type: application/json" \
+    -d "${REGISTER_PAYLOAD}" \
+    "${GATEWAY_URL}/internal/register" || {
+        echo "WARNING: Failed to register with gateway, but continuing..."
+    }
+
+echo "vLLM server running. Waiting for job termination..."
+
+# Keep job alive until Slurm kills it or vLLM exits
+wait $VLLM_PID
+EXIT_CODE=$?
+
+echo "vLLM exited with code ${EXIT_CODE}"
+cleanup

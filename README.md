@@ -22,8 +22,9 @@ The answer: run overlapping rolling vLLM job reservations on the cluster, and ha
 
 - Python 3.10+
 - Access to a Slurm cluster with GPU nodes
-- vLLM installed on compute nodes (or in a shared venv)
+- vLLM Singularity container (or venv with vLLM installed)
 - Shared filesystem (NFS) accessible from login and compute nodes
+- Model weights pre-downloaded to HuggingFace cache (for air-gapped compute nodes)
 
 ### Installation
 
@@ -43,7 +44,30 @@ cp tequila-mule.toml ~/.tequila-mule/
 # Edit ~/.tequila-mule/tequila-mule.toml with your partition, wall-time, model, etc.
 ```
 
+### First-Time Setup (Reedling HPC)
+
+If running on air-gapped compute nodes, pre-stage container and model weights:
+
+```bash
+# On login node (has internet access)
+mkdir -p ~/containers
+singularity pull ~/containers/vllm-openai.sif docker://vllm/vllm-openai:latest
+
+# Pre-download model weights
+pip install --user huggingface-cli
+huggingface-cli download meta-llama/Llama-3.1-8B
+```
+
+Update config paths to match your environment (see `tequila-mule.toml`).
+
 ### Running
+
+Generate API key (recommended):
+
+```bash
+tequila-mule add-key your.email@example.com
+# Save the generated key for client configuration
+```
 
 Start the gateway:
 
@@ -51,31 +75,42 @@ Start the gateway:
 tequila-mule start
 ```
 
-This will submit the first vLLM job and enter a holding pattern (`503 Retry-After`) until the backend is ready. Estimated wait time is printed to stdout.
+This will submit the first vLLM job and enter a holding pattern (`503 Retry-After`) until the backend is ready. Check status in another terminal:
 
-Once the backend is warm, the gateway accepts requests at `http://localhost:8080` (configurable).
+```bash
+tequila-mule status
+```
+
+Once the backend is warm, the gateway accepts requests at `http://localhost:8765` (configurable).
 
 Test it:
 
 ```bash
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer changeme" \
+# Get your API key (use email from add-key command)
+export OPENAI_API_KEY=$(tequila-mule show-key your.email@example.com | grep -o 'sk-[^ ]*')
+
+curl -X POST http://localhost:8765/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "meta-llama/Llama-3-8B-Instruct",
+    "model": "meta-llama/Llama-3.1-8B",
     "messages": [{"role": "user", "content": "Hello!"}],
-    "stream": true
+    "stream": false
   }'
 ```
 
 ### Command Reference
 
 ```bash
-tequila-mule start          # Start the gateway (foreground)
-tequila-mule status         # Show current backend, job IDs, health
-tequila-mule rotate         # Manually force an immediate rotation (testing)
-tequila-mule stop           # Graceful shutdown
-tequila-mule logs           # Tail gateway and job logs
+tequila-mule start                  # Start the gateway (foreground)
+tequila-mule status                 # Show current backend, job IDs, health
+tequila-mule stop                   # Graceful shutdown (Ctrl+C in start terminal)
+
+# API key management
+tequila-mule add-key <email>        # Create API key for user
+tequila-mule list-keys              # List all API keys
+tequila-mule show-key [email]       # Show key for email (or all keys)
+tequila-mule revoke-key <key|email> # Revoke API key
 ```
 
 ## Architecture

@@ -33,6 +33,7 @@ tequila-mule/
 │   ├── gateway.py              # FastAPI app, OpenAI-compatible proxy
 │   ├── lifecycle.py            # Job submission & rotation logic
 │   ├── health.py               # Backend health monitoring
+│   ├── keystore.py             # API key management (multi-user)
 │   ├── cli.py                  # Command-line interface
 │   ├── config.py               # Config loading & validation
 │   └── templates/
@@ -40,6 +41,7 @@ tequila-mule/
 ├── tests/
 │   ├── test_gateway.py
 │   ├── test_lifecycle.py
+│   ├── test_keystore.py
 │   ├── test_health.py
 │   └── test_config.py
 ├── pyproject.toml              # Dependencies & package metadata
@@ -192,11 +194,12 @@ Key config sections:
 
 ## Common Gotchas
 
-1. **Port conflicts**: `port_range` in config must not overlap with existing services on compute nodes
+1. **Port conflicts**: Fixed port (50000) must not conflict with existing services on compute nodes
 2. **Wall-time alignment**: `wall_time` config must match cluster policy; misalignment causes unexpected job kills
 3. **Lead time too short**: If `lead_time_minutes` is too small, new job may not reach RUNNING before current job expires
-4. **Shared filesystem**: vLLM model weights and Python venv must be accessible from both login and compute nodes
-5. **API key security**: `api_key` in config is single-shared secret; not suitable for multi-tenant (out of scope v1)
+4. **Shared filesystem**: vLLM model weights and Singularity container must be accessible from both login and compute nodes
+5. **API key management**: Each key tied to an email; use `tequila-mule add-key <email>` to create, tracks last_used timestamp
+6. **Air-gapped compute nodes**: Pre-download container and model weights on login node before first run
 
 ## Deployment Notes
 

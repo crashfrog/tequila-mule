@@ -43,3 +43,6 @@ state.json
 .DS_Store
 .env
 .env.local
+
+# Internal HPC docs (site-specific, do not commit)
+REEDLING.md
