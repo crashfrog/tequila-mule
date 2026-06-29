@@ -1,0 +1,24 @@
+# tequila-mule configuration for FDA Reedling HPC
+
+[gateway]
+host = "0.0.0.0"
+port = 8000
+
+[slurm]
+partition = "gpu"
+gres = "gpu:h100:1"
+gpus_per_job = 1
+wall_time = "48:00:00"
+lead_time_minutes = 360
+port = 50000
+
+[model]
+name = "Qwen2.5-Coder-7B-Instruct"
+vllm_extra_args = "--tensor-parallel-size 1 --max-model-len 8192 --gpu-memory-utilization 0.9 --dtype auto --enable-prefix-caching --max-num-seqs 256 --enable-chunked-prefill"
+
+[paths]
+container_path = "/home/user/.tequila-mule/containers/vllm-sandbox"
+job_template = "/home/user/.tequila-mule/vllm_job.sh.j2"
+state_file = "~/.tequila-mule/state.json"
+log_dir = "~/.tequila-mule/logs"
+api_keys_file = "~/.tequila-mule/api_keys.json"

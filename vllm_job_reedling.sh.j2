@@ -1,0 +1,125 @@
+#!/bin/bash
+#SBATCH --job-name=tequila-mule-vllm
+#SBATCH --partition={{ partition }}
+#SBATCH --gres={{ gres }}
+#SBATCH --cpus-per-task={{ cpus_per_task }}
+#SBATCH --mem={{ memory }}
+#SBATCH --time={{ wall_time }}
+#SBATCH --output={{ log_dir }}/slurm-%j.out
+#SBATCH --error={{ log_dir }}/slurm-%j.err
+
+# Reedling HPC-specific vLLM job template for tequila-mule
+
+set -euo pipefail
+
+# Job metadata
+JOB_ID=${SLURM_JOB_ID}
+NODE=$(hostname)
+PORT={{ port }}
+MODEL_NAME="{{ model_name }}"
+MODEL_PATH="{{ model_path }}"
+CONTAINER="{{ container }}"
+GATEWAY_URL="{{ gateway_url }}"
+INTERNAL_API_KEY="{{ internal_api_key }}"
+
+echo "=========================================="
+echo "tequila-mule vLLM Backend Job"
+echo "=========================================="
+echo "Job ID: ${JOB_ID}"
+echo "Node: ${NODE}"
+echo "Port: ${PORT}"
+echo "Model: ${MODEL_NAME}"
+echo "Started: $(date)"
+echo "=========================================="
+
+# Trap SIGTERM to gracefully deregister before job is killed
+trap 'echo "Received SIGTERM, deregistering..."; curl -X POST "${GATEWAY_URL}/internal/deregister" -H "X-Internal-Key: ${INTERNAL_API_KEY}" -d "{\"job_id\": \"${JOB_ID}\"}"; exit 0' SIGTERM
+
+# Set CUDA environment variables
+export CUDA_VISIBLE_DEVICES=0
+export NCCL_DEBUG=INFO
+
+# vLLM arguments
+VLLM_ARGS="{{ vllm_extra_args | join(' ') }}"
+
+echo "Starting vLLM server..."
+echo "Command: singularity exec --nv ${CONTAINER} python3 -m vllm.entrypoints.openai.api_server"
+
+# Start vLLM server in background
+# Note: --writable-tmpfs for sandbox containers
+singularity exec --nv \
+    --writable-tmpfs \
+    --bind ${MODEL_PATH}:/models:ro \
+    --bind $(pwd):/workspace \
+    --pwd /workspace \
+    ${CONTAINER} \
+    python3 -m vllm.entrypoints.openai.api_server \
+    --model /models/${MODEL_NAME} \
+    --host 0.0.0.0 \
+    --port ${PORT} \
+    ${VLLM_ARGS} &
+
+VLLM_PID=$!
+echo "vLLM server started with PID: ${VLLM_PID}"
+
+# Wait for vLLM to be ready
+echo "Waiting for vLLM server to be ready..."
+MAX_RETRIES=60
+RETRY_INTERVAL=5
+for i in $(seq 1 ${MAX_RETRIES}); do
+    if curl -s -f http://localhost:${PORT}/health > /dev/null 2>&1; then
+        echo "vLLM server is ready!"
+        break
+    fi
+    if [ $i -eq ${MAX_RETRIES} ]; then
+        echo "ERROR: vLLM server failed to start after $((MAX_RETRIES * RETRY_INTERVAL)) seconds"
+        kill ${VLLM_PID} 2>/dev/null || true
+        exit 1
+    fi
+    echo "Retry $i/${MAX_RETRIES}: vLLM not ready yet, waiting ${RETRY_INTERVAL}s..."
+    sleep ${RETRY_INTERVAL}
+done
+
+# Register with gateway
+echo "Registering with gateway at ${GATEWAY_URL}..."
+MAX_REGISTER_RETRIES=10
+for i in $(seq 1 ${MAX_REGISTER_RETRIES}); do
+    if curl -X POST "${GATEWAY_URL}/internal/register" \
+        -H "Content-Type: application/json" \
+        -H "X-Internal-Key: ${INTERNAL_API_KEY}" \
+        -d "{\"job_id\": \"${JOB_ID}\", \"node\": \"${NODE}\", \"port\": ${PORT}}" \
+        -f -s > /dev/null 2>&1; then
+        echo "Successfully registered with gateway!"
+        break
+    fi
+    if [ $i -eq ${MAX_REGISTER_RETRIES} ]; then
+        echo "WARNING: Failed to register with gateway after ${MAX_REGISTER_RETRIES} attempts"
+        echo "Gateway may not be reachable from compute node. Using polling fallback."
+    else
+        echo "Registration attempt $i/${MAX_REGISTER_RETRIES} failed, retrying in 5s..."
+        sleep 5
+    fi
+done
+
+echo "=========================================="
+echo "vLLM backend is now serving requests"
+echo "Endpoint: http://${NODE}:${PORT}"
+echo "Job will run until: $(squeue -j ${JOB_ID} -h -o %e)"
+echo "=========================================="
+
+# Keep job alive and monitor vLLM process
+while kill -0 ${VLLM_PID} 2>/dev/null; do
+    sleep 60
+    # Periodic health check log
+    if curl -s -f http://localhost:${PORT}/health > /dev/null 2>&1; then
+        echo "[$(date)] Health check: OK"
+    else
+        echo "[$(date)] Health check: FAILED"
+        echo "vLLM server appears unhealthy, exiting..."
+        kill ${VLLM_PID} 2>/dev/null || true
+        exit 1
+    fi
+done
+
+echo "vLLM process exited, job ending."
+exit 0
