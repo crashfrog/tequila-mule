@@ -73,13 +73,27 @@ class Gateway:
             )
 
         url = f"{self.current_backend}{endpoint}"
-        body = await request.body()
+        # Rewrite the model field to the configured model name so clients
+        # can use any alias. Also strip fields vLLM 0.4.x doesn't support
+        # (tools, tool_choice, store, etc.) to avoid 400 validation errors.
+        _UNSUPPORTED = {"tools", "tool_choice", "store", "parallel_tool_calls", "stream_options"}
+        try:
+            body_json = json.loads(await request.body())
+            if "model" in body_json:
+                body_json["model"] = self.config.model.name
+            for key in _UNSUPPORTED:
+                body_json.pop(key, None)
+            body = json.dumps(body_json).encode()
+        except (json.JSONDecodeError, Exception):
+            body = await request.body()
 
         try:
             if stream:
                 # Stream response from backend, normalizing SSE chunks to
                 # match the OpenAI spec: the final chunk must have an empty
                 # delta ({}) with finish_reason set, not delta={"content":""}.
+                # If the backend returns a non-2xx status, forward it as JSON
+                # (headers not yet sent at that point so we can still do this).
                 async def stream_response():
                     async with self.client.stream(
                         "POST",
@@ -87,10 +101,20 @@ class Gateway:
                         content=body,
                         headers={"Content-Type": "application/json"},
                     ) as resp:
+                        if resp.status_code >= 400:
+                            error_body = await resp.aread()
+                            logger.error(f"Backend stream error {resp.status_code}: {error_body[:200]}")
+                            # Emit a terminal SSE error so the client gets a
+                            # meaningful failure instead of an empty stream.
+                            err = json.dumps({"error": {"message": error_body.decode(errors="replace"), "type": "backend_error", "code": resp.status_code}})
+                            yield b"data: " + err.encode() + b"\n\n"
+                            yield b"data: [DONE]\n\n"
+                            return
                         async for line in resp.aiter_lines():
+                            if not line:
+                                continue  # skip blank separator lines
                             if not line.startswith("data: "):
-                                yield line.encode() + b"\n"
-                                continue
+                                continue  # skip other fields (event:, id:, etc.)
                             payload = line[6:]
                             if payload == "[DONE]":
                                 yield b"data: [DONE]\n\n"
@@ -104,12 +128,10 @@ class Gateway:
                                     # spec wants delta={} for that event.
                                     if choice.get("finish_reason") and delta.get("content") == "":
                                         choice["delta"] = {}
-                                    # Strip usage from streaming chunks —
-                                    # not all clients handle it correctly.
-                                    chunk.pop("usage", None)
+                                chunk.pop("usage", None)
                                 yield b"data: " + json.dumps(chunk).encode() + b"\n\n"
                             except (json.JSONDecodeError, KeyError):
-                                yield line.encode() + b"\n\n"
+                                yield b"data: " + payload.encode() + b"\n\n"
 
                 return StreamingResponse(
                     stream_response(),
@@ -138,6 +160,7 @@ class Gateway:
         """OpenAI chat completions endpoint."""
         body = await request.json()
         stream = body.get("stream", False)
+        logger.info(f"chat/completions: stream={stream} model={body.get('model')} messages={len(body.get('messages', []))}")
         return await self._proxy_request(request, "/v1/chat/completions", stream=stream)
 
     async def _completions(self, request: Request) -> Response:
