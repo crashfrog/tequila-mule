@@ -1,6 +1,7 @@
 """FastAPI gateway with OpenAI-compatible endpoints."""
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -76,7 +77,9 @@ class Gateway:
 
         try:
             if stream:
-                # Stream response from backend
+                # Stream response from backend, normalizing SSE chunks to
+                # match the OpenAI spec: the final chunk must have an empty
+                # delta ({}) with finish_reason set, not delta={"content":""}.
                 async def stream_response():
                     async with self.client.stream(
                         "POST",
@@ -84,8 +87,29 @@ class Gateway:
                         content=body,
                         headers={"Content-Type": "application/json"},
                     ) as resp:
-                        async for chunk in resp.aiter_bytes():
-                            yield chunk
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                yield line.encode() + b"\n"
+                                continue
+                            payload = line[6:]
+                            if payload == "[DONE]":
+                                yield b"data: [DONE]\n\n"
+                                continue
+                            try:
+                                chunk = json.loads(payload)
+                                for choice in chunk.get("choices", []):
+                                    delta = choice.get("delta", {})
+                                    # vLLM 0.4.x bundles content="" with
+                                    # finish_reason in the last chunk; OpenAI
+                                    # spec wants delta={} for that event.
+                                    if choice.get("finish_reason") and delta.get("content") == "":
+                                        choice["delta"] = {}
+                                    # Strip usage from streaming chunks —
+                                    # not all clients handle it correctly.
+                                    chunk.pop("usage", None)
+                                yield b"data: " + json.dumps(chunk).encode() + b"\n\n"
+                            except (json.JSONDecodeError, KeyError):
+                                yield line.encode() + b"\n\n"
 
                 return StreamingResponse(
                     stream_response(),

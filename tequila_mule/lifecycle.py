@@ -165,9 +165,11 @@ class LifecycleManager:
                 logger.warning(f"Current job {self.current_job.job_id} no longer valid")
                 self.current_job = None
 
-        # Cold start: submit job immediately if no current job
+        # Cold start: submit job immediately if no current job.
+        # Run as a background task so uvicorn finishes startup and can
+        # accept the /internal/register callback from the compute node.
         if not self.current_job:
-            await self._cold_start()
+            asyncio.create_task(self._cold_start())
 
         self.task = asyncio.create_task(self._rotation_loop())
         logger.info("Lifecycle manager started")
