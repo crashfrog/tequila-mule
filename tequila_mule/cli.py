@@ -1,10 +1,10 @@
 """Command-line interface."""
 
-import asyncio
+import glob
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import click
 import uvicorn
@@ -24,29 +24,51 @@ class GatewayServer:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.gateway = Gateway(config)
-        self.health_monitor = HealthMonitor()
-        self.lifecycle_manager = LifecycleManager(config, self.gateway)
+        self.health_monitors: dict[str, HealthMonitor] = {}
+        self.lifecycle_managers: dict[str, LifecycleManager] = {}
 
-        # Wire up health monitor callback
-        self.health_monitor.set_unhealthy_callback(self._on_backend_unhealthy)
+        for backend in config.backends:
+            health_monitor = HealthMonitor(backend.name)
+            health_monitor.set_unhealthy_callback(self._make_unhealthy_callback(backend.name))
 
-    async def _on_backend_unhealthy(self) -> None:
-        """Callback when backend becomes unhealthy."""
-        logger.warning("Backend unhealthy, lifecycle manager will handle rotation")
-        # Lifecycle manager will detect and rotate on next check
+            lifecycle_manager = LifecycleManager(
+                backend,
+                config.paths,
+                config.gateway.host,
+                config.gateway.port,
+                self.gateway,
+            )
+
+            self.health_monitors[backend.name] = health_monitor
+            self.lifecycle_managers[backend.name] = lifecycle_manager
+
+    def _make_unhealthy_callback(self, backend_name: str) -> Callable[[], Awaitable[None]]:
+        """Build a per-backend callback for health monitor failures."""
+
+        async def _on_backend_unhealthy() -> None:
+            logger.warning(
+                f"[{backend_name}] Backend unhealthy, lifecycle manager will handle rotation"
+            )
+            # Lifecycle manager will detect and rotate on next check
+
+        return _on_backend_unhealthy
 
     async def start(self) -> None:
         """Start all components."""
-        # Start lifecycle manager (handles cold start)
-        await self.lifecycle_manager.start()
+        for lifecycle_manager in self.lifecycle_managers.values():
+            await lifecycle_manager.start()
 
-        # Start health monitor
-        await self.health_monitor.start()
+        for health_monitor in self.health_monitors.values():
+            await health_monitor.start()
 
     async def stop(self) -> None:
         """Stop all components."""
-        await self.lifecycle_manager.stop()
-        await self.health_monitor.stop()
+        for lifecycle_manager in self.lifecycle_managers.values():
+            await lifecycle_manager.stop()
+
+        for health_monitor in self.health_monitors.values():
+            await health_monitor.stop()
+
         await self.gateway.shutdown()
 
 
@@ -101,8 +123,10 @@ def start(config: Config) -> None:
     """Start the gateway server."""
     click.echo("Starting tequila-mule gateway...")
     click.echo(f"Gateway: {config.gateway.host}:{config.gateway.port}")
-    click.echo(f"Model: {config.model.name}")
-    click.echo(f"Partition: {config.slurm.partition}")
+    click.echo(f"Backends ({len(config.backends)}):")
+    for backend in config.backends:
+        aliases = f" aliases={backend.aliases}" if backend.aliases else ""
+        click.echo(f"  - {backend.name}: {backend.model.name}{aliases}")
 
     # Check if auth enabled
     keystore_path = Path(config.paths.api_keys_file).expanduser()
@@ -119,41 +143,48 @@ def start(config: Config) -> None:
 @click.pass_obj
 def status(config: Config) -> None:
     """Show current status."""
-    state_file = Path(config.paths.state_file).expanduser()
+    import json
 
-    if not state_file.exists():
+    state_file_pattern = str(Path(config.paths.state_file).expanduser().with_name("state-*.json"))
+    legacy_state_file = Path(config.paths.state_file).expanduser()
+
+    state_files = sorted(glob.glob(state_file_pattern))
+    if not state_files and legacy_state_file.exists():
+        state_files = [str(legacy_state_file)]
+
+    if not state_files:
         click.echo("No state file found. Gateway may not be running.")
         return
 
-    import json
-
-    with open(state_file) as f:
-        state = json.load(f)
-
     click.echo("=== tequila-mule Status ===")
-    click.echo(f"Updated: {state.get('updated_at', 'unknown')}")
-    click.echo()
 
-    current = state.get("current_job")
-    if current:
-        click.echo("Current Job:")
-        click.echo(f"  Job ID: {current['job_id']}")
-        click.echo(f"  Node: {current.get('node', 'unknown')}")
-        click.echo(f"  Status: {current['status']}")
-        click.echo(f"  Expires: {current['expires_at']}")
-    else:
-        click.echo("Current Job: None")
+    for state_file in state_files:
+        name = Path(state_file).stem.removeprefix("state-")
+        with open(state_file) as f:
+            state = json.load(f)
 
-    click.echo()
+        click.echo()
+        click.echo(f"--- Backend: {name} ---")
+        click.echo(f"Updated: {state.get('updated_at', 'unknown')}")
 
-    pending = state.get("pending_job")
-    if pending:
-        click.echo("Pending Job:")
-        click.echo(f"  Job ID: {pending['job_id']}")
-        click.echo(f"  Status: {pending['status']}")
-        click.echo(f"  Submitted: {pending['submitted_at']}")
-    else:
-        click.echo("Pending Job: None")
+        current = state.get("current_job")
+        if current:
+            click.echo("Current Job:")
+            click.echo(f"  Job ID: {current['job_id']}")
+            click.echo(f"  Node: {current.get('node', 'unknown')}")
+            click.echo(f"  Status: {current['status']}")
+            click.echo(f"  Expires: {current['expires_at']}")
+        else:
+            click.echo("Current Job: None")
+
+        pending = state.get("pending_job")
+        if pending:
+            click.echo("Pending Job:")
+            click.echo(f"  Job ID: {pending['job_id']}")
+            click.echo(f"  Status: {pending['status']}")
+            click.echo(f"  Submitted: {pending['submitted_at']}")
+        else:
+            click.echo("Pending Job: None")
 
 
 @main.command()

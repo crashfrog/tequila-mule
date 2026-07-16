@@ -1,8 +1,6 @@
 """Tests for lifecycle manager."""
 
-import json
 from datetime import datetime, timedelta
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,7 +13,8 @@ from tequila_mule.lifecycle import JobState, LifecycleManager
 def mock_gateway():
     """Mock gateway."""
     gateway = MagicMock()
-    gateway.current_backend = None
+    gateway.get_backend = MagicMock(return_value=None)
+    gateway.set_backend = AsyncMock()
     return gateway
 
 
@@ -26,7 +25,10 @@ def lifecycle_manager(mock_gateway, tmp_path):
     config.paths.state_file = str(tmp_path / "state.json")
     config.paths.job_template = "tequila_mule/templates/vllm_job.sh.j2"
 
-    manager = LifecycleManager(config, mock_gateway)
+    backend_config = config.backends[0]
+    manager = LifecycleManager(
+        backend_config, config.paths, "gw-host", 8765, mock_gateway
+    )
     return manager
 
 
@@ -83,6 +85,92 @@ def test_save_and_load_state(lifecycle_manager):
     assert lifecycle_manager.current_job is not None
     assert lifecycle_manager.current_job.job_id == "12345"
     assert lifecycle_manager.current_job.node == "gpu-node-01"
+
+
+def test_two_managers_do_not_share_state(mock_gateway, tmp_path):
+    """Two LifecycleManagers for different backends must write to separate
+    per-backend state files and not clobber each other's state."""
+    config = Config()
+    config.paths.state_file = str(tmp_path / "state.json")
+    config.paths.job_template = "tequila_mule/templates/vllm_job.sh.j2"
+
+    backend_a = config.backends[0].model_copy(update={"name": "backend-a"})
+    backend_b = config.backends[0].model_copy(update={"name": "backend-b"})
+
+    manager_a = LifecycleManager(backend_a, config.paths, "gw-host", 8765, mock_gateway)
+    manager_b = LifecycleManager(backend_b, config.paths, "gw-host", 8765, mock_gateway)
+
+    assert manager_a.state_file != manager_b.state_file
+
+    submitted_at = datetime.utcnow()
+    expires_at = submitted_at + timedelta(hours=23)
+
+    manager_a.current_job = JobState(
+        job_id="aaa",
+        node="g001",
+        port=50000,
+        status="RUNNING",
+        submitted_at=submitted_at.isoformat(),
+        expires_at=expires_at.isoformat(),
+        backend_url="http://g001:50000",
+    )
+    manager_a._save_state()
+
+    manager_b.current_job = JobState(
+        job_id="bbb",
+        node="g002",
+        port=50001,
+        status="RUNNING",
+        submitted_at=submitted_at.isoformat(),
+        expires_at=expires_at.isoformat(),
+        backend_url="http://g002:50001",
+    )
+    manager_b._save_state()
+
+    manager_a._load_state()
+    manager_b._load_state()
+
+    assert manager_a.current_job.job_id == "aaa"
+    assert manager_b.current_job.job_id == "bbb"
+
+
+def test_legacy_state_file_migration(mock_gateway, tmp_path):
+    """A "default" backend with no per-backend state file yet should fall
+    back to reading the legacy single-backend state.json, so an in-place
+    upgrade doesn't lose track of an already-running job."""
+    config = Config()
+    config.paths.state_file = str(tmp_path / "state.json")
+    config.paths.job_template = "tequila_mule/templates/vllm_job.sh.j2"
+
+    legacy_manager = LifecycleManager(
+        config.backends[0], config.paths, "gw-host", 8765, mock_gateway
+    )
+    # Simulate the pre-upgrade shape: write directly to legacy state.json
+    legacy_manager.state_file = legacy_manager._legacy_state_file
+    submitted_at = datetime.utcnow()
+    expires_at = submitted_at + timedelta(hours=23)
+    legacy_manager.current_job = JobState(
+        job_id="legacy-1",
+        node="g999",
+        port=50000,
+        status="RUNNING",
+        submitted_at=submitted_at.isoformat(),
+        expires_at=expires_at.isoformat(),
+        backend_url="http://g999:50000",
+    )
+    legacy_manager._save_state()
+
+    # New manager, as constructed post-upgrade, uses the new per-backend path
+    new_manager = LifecycleManager(
+        config.backends[0], config.paths, "gw-host", 8765, mock_gateway
+    )
+    assert new_manager.name == "default"
+    assert not new_manager.state_file.exists()
+
+    new_manager._load_state()
+
+    assert new_manager.current_job is not None
+    assert new_manager.current_job.job_id == "legacy-1"
 
 
 @patch("tequila_mule.lifecycle.subprocess.run")

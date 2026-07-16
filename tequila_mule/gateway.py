@@ -3,8 +3,9 @@
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, status
@@ -15,16 +16,31 @@ from .keystore import KeyStore
 
 logger = logging.getLogger(__name__)
 
+_UNSUPPORTED = {"tools", "tool_choice", "store", "parallel_tool_calls", "stream_options"}
+
+
+@dataclass
+class BackendEntry:
+    """A live, registered backend for one configured backend pool."""
+
+    url: str  # "http://node:port"
+    model_name: str
+    job_id: str
+
 
 class Gateway:
-    """OpenAI-compatible gateway proxy."""
+    """OpenAI-compatible gateway proxy, routing across multiple backend pools."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
         self.app = FastAPI(title="tequila-mule", version="0.1.0")
-        self.current_backend: Optional[str] = None  # "http://node:port"
+        self.backends: Dict[str, BackendEntry] = {}  # keyed by backend pool name
         self.backend_lock = asyncio.Lock()
         self.client = httpx.AsyncClient(timeout=300.0)  # 5min for long completions
+
+        # Static routing table: canonical backend name, model name, and every
+        # alias all resolve to the owning backend pool's name.
+        self._route_table: Dict[str, str] = self._build_route_table(config)
 
         # Load keystore
         keystore_path = Path(config.paths.api_keys_file).expanduser()
@@ -36,6 +52,31 @@ class Gateway:
         self.app.get("/v1/models")(self._models)
         self.app.post("/internal/register")(self._register_backend)
         self.app.get("/health")(self._health)
+
+    @staticmethod
+    def _build_route_table(config: Config) -> Dict[str, str]:
+        table: Dict[str, str] = {}
+        for backend in config.backends:
+            table[backend.name] = backend.name
+            table[backend.model.name] = backend.name
+            for alias in backend.aliases:
+                table[alias] = backend.name
+        return table
+
+    def get_backend(self, backend_name: str) -> Optional[str]:
+        """Return the URL currently registered for a backend pool, if any."""
+        entry = self.backends.get(backend_name)
+        return entry.url if entry else None
+
+    async def set_backend(
+        self, backend_name: str, backend_url: str, model_name: str = "", job_id: str = ""
+    ) -> None:
+        """Set the live backend for a pool (used by the lifecycle manager)."""
+        async with self.backend_lock:
+            logger.info(f"[{backend_name}] Switching backend to: {backend_url}")
+            self.backends[backend_name] = BackendEntry(
+                url=backend_url, model_name=model_name, job_id=job_id
+            )
 
     async def _check_auth(self, request: Request) -> Optional[str]:
         """Check API key if auth enabled. Returns email if authenticated."""
@@ -62,30 +103,39 @@ class Gateway:
     async def _proxy_request(
         self, request: Request, endpoint: str, stream: bool = False
     ) -> Response:
-        """Proxy request to current backend."""
+        """Resolve the target backend by model/alias and proxy the request."""
         await self._check_auth(request)
 
-        if not self.current_backend:
+        try:
+            body_json = json.loads(await request.body())
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON body")
+
+        requested_model = body_json.get("model")
+        backend_name = self._route_table.get(requested_model) if requested_model else None
+        if backend_name is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown model: {requested_model!r}",
+            )
+
+        entry = self.backends.get(backend_name)
+        if not entry:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="No backend available",
+                detail=f"Backend for model {requested_model!r} not ready",
                 headers={"Retry-After": "60"},
             )
 
-        url = f"{self.current_backend}{endpoint}"
-        # Rewrite the model field to the configured model name so clients
-        # can use any alias. Also strip fields vLLM 0.4.x doesn't support
-        # (tools, tool_choice, store, etc.) to avoid 400 validation errors.
-        _UNSUPPORTED = {"tools", "tool_choice", "store", "parallel_tool_calls", "stream_options"}
-        try:
-            body_json = json.loads(await request.body())
-            if "model" in body_json:
-                body_json["model"] = self.config.model.name
-            for key in _UNSUPPORTED:
-                body_json.pop(key, None)
-            body = json.dumps(body_json).encode()
-        except (json.JSONDecodeError, Exception):
-            body = await request.body()
+        url = f"{entry.url}{endpoint}"
+        # Rewrite the model field to the backend's actual served model name so
+        # clients can use a canonical name or alias. Also strip fields vLLM
+        # 0.4.x doesn't support (tools, tool_choice, store, etc.) to avoid
+        # 400 validation errors.
+        body_json["model"] = entry.model_name
+        for key in _UNSUPPORTED:
+            body_json.pop(key, None)
+        body = json.dumps(body_json).encode()
 
         try:
             if stream:
@@ -170,27 +220,29 @@ class Gateway:
         return await self._proxy_request(request, "/v1/completions", stream=stream)
 
     async def _models(self, request: Request) -> Response:
-        """OpenAI models endpoint."""
+        """OpenAI models endpoint. Lists canonical model names and aliases
+        for every currently-registered (live) backend."""
         await self._check_auth(request)
 
-        if not self.current_backend:
+        data = []
+        for backend in self.config.backends:
+            entry = self.backends.get(backend.name)
+            if not entry:
+                continue  # pool has no live job yet; don't advertise it
+            data.append({"id": entry.model_name, "object": "model", "owned_by": "tequila-mule"})
+            for alias in backend.aliases:
+                data.append({"id": alias, "object": "model", "owned_by": "tequila-mule"})
+
+        if not data:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="No backend available",
             )
 
-        try:
-            resp = await self.client.get(f"{self.current_backend}/v1/models")
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                media_type="application/json",
-            )
-        except httpx.RequestError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Backend unreachable",
-            )
+        return Response(
+            content=json.dumps({"object": "list", "data": data}),
+            media_type="application/json",
+        )
 
     async def _register_backend(self, request: Request) -> dict:
         """Internal endpoint for backends to register themselves."""
@@ -198,27 +250,27 @@ class Gateway:
         job_id = data["job_id"]
         node = data["node"]
         port = data["port"]
+        backend_name = data.get("backend_name")
+        model_name = data.get("model_name", "")
+
+        valid_names = {b.name for b in self.config.backends}
+        if backend_name not in valid_names:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown backend_name: {backend_name!r}",
+            )
 
         backend_url = f"http://{node}:{port}"
+        await self.set_backend(backend_name, backend_url, model_name=model_name, job_id=job_id)
 
-        async with self.backend_lock:
-            logger.info(f"Backend registered: {backend_url} (job {job_id})")
-            self.current_backend = backend_url
-
-        return {"status": "registered", "backend": backend_url}
+        return {"status": "registered", "backend": backend_url, "backend_name": backend_name}
 
     async def _health(self) -> dict:
         """Gateway health check."""
         return {
             "status": "healthy",
-            "backend": self.current_backend if self.current_backend else "none",
+            "backends": {name: entry.url for name, entry in self.backends.items()},
         }
-
-    async def set_backend(self, backend_url: str) -> None:
-        """Set current backend (used by lifecycle manager)."""
-        async with self.backend_lock:
-            logger.info(f"Switching backend to: {backend_url}")
-            self.current_backend = backend_url
 
     async def shutdown(self) -> None:
         """Shutdown gateway."""

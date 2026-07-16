@@ -8,13 +8,55 @@ An OpenAI-compatible gateway service that provides stable, continuous inference 
 
 The answer: run overlapping rolling vLLM job reservations on the cluster, and have a lightweight gateway on the login node that automatically rotates to a new backend before the current job is killed by the scheduler. Clients never see a gap.
 
+### Why not just use Ollama?
+
+Ollama and vLLM solve a different problem than tequila-mule does. Ollama gives you an OpenAI-compatible API and model serving, same as vLLM — but it has no concept of Slurm, job wall-time, or backend rotation, and its multi-GPU support is layer-splitting (like llama.cpp), not true tensor parallelism, so it can't match vLLM's throughput for large models split across multiple GPUs (e.g. `--tensor-parallel-size 2`). It also has no multi-user API key management.
+
+tequila-mule's value is the scheduling/rotation glue *around* a serving engine (Slurm job submission, lead-time rotation, health-checked failover, API keystore) — swapping the backend from vLLM to Ollama wouldn't remove any of that code, and would cost you tensor parallelism on multi-GPU jobs.
+
 ## Features
 
 - **OpenAI-compatible API** — drop-in replacement for clients using `openai` SDK or `curl`
 - **No API changes needed** — works with existing LangChain, Pi.ai, or custom client code
 - **Transparent job rotation** — gateway swaps backends without dropping requests
+- **Multi-model hosting** — run several independently-rotating model pools (e.g. a large model on multiple GPUs plus small models on single GPUs) behind one endpoint, routed by model name or alias, similar to AWS Bedrock
 - **User-level permissions** — no admin privileges required; runs as a regular user
 - **Simple deployment** — `pip install` and a config file; designed for researchers, not SREs
+
+### Multi-model routing
+
+A gateway instance can manage any number of backend pools, each with its own Slurm sizing, model, and rotation timeline. Configure them as `[[backends]]` entries in the TOML (see `tequila-mule.toml`):
+
+```toml
+[[backends]]
+name = "llama-3.3-70b"
+aliases = ["llama", "default"]
+[backends.slurm]
+gres = "gpu:h100:2"
+port = 50000
+[backends.model]
+name = "meta-llama/Llama-3.3-70B-Instruct"
+vllm_extra_args = "--tensor-parallel-size 2"
+
+[[backends]]
+name = "small-model-a"
+aliases = ["small", "fast"]
+[backends.slurm]
+gres = "gpu:h100:1"
+port = 50001
+[backends.model]
+name = "..."
+```
+
+Clients target a pool by sending either its exact model name or one of its aliases in the `model` field:
+
+```bash
+curl ... -d '{"model": "small", "messages": [...]}'
+```
+
+Each pool runs its own independent Slurm job lifecycle (submission, rotation, health checks) — one pool rotating or cold-starting never affects another. An unrecognized `model` value returns `400`. `GET /v1/models` lists the canonical model name and every alias for each currently-live pool.
+
+Existing single-model configs (top-level `[slurm]`/`[model]`, no `[[backends]]`) keep working unchanged — they're automatically treated as one backend pool named `"default"`.
 
 ## Quick Start
 
@@ -115,11 +157,11 @@ tequila-mule revoke-key <key|email> # Revoke API key
 
 ## Architecture
 
-Three core components:
+Three core components, each instantiated **once per configured backend pool**:
 
-1. **Gateway** — FastAPI app on the login node, proxies requests to active vLLM backend
-2. **Lifecycle Manager** — Background thread that submits new Slurm jobs before current job expires, orchestrates rotation
-3. **Health Monitor** — Background thread that polls backend health, triggers rotation on failure
+1. **Gateway** — FastAPI app on the login node; routes each request to the backend pool owning the requested model name/alias, and proxies to that pool's active vLLM backend
+2. **Lifecycle Manager** — one per backend pool; submits new Slurm jobs before that pool's current job expires, orchestrates rotation independently of other pools
+3. **Health Monitor** — one per backend pool; polls that pool's backend health, triggers rotation on failure
 
 See [CLAUDE.md](CLAUDE.md) for detailed architecture and development notes.
 
@@ -127,10 +169,11 @@ See [CLAUDE.md](CLAUDE.md) for detailed architecture and development notes.
 
 See `tequila-mule.toml` for all options. Key sections:
 
-- `[gateway]` — host, port, API key, request retry window
-- `[slurm]` — partition, GPU request, wall-time, lead-time, job overlap count, port range
-- `[model]` — model name and vLLM arguments
+- `[gateway]` — host, port, request retry window
+- `[[backends]]` — one entry per model pool; each has its own `[backends.slurm]` (partition, GPU request, wall-time, lead-time, port) and `[backends.model]` (model name, vLLM arguments), plus an `aliases` list
 - `[paths]` — config file locations, state file, logs directory
+
+Legacy top-level `[slurm]`/`[model]` tables (no `[[backends]]`) are still supported and are migrated automatically into a single `"default"` backend pool.
 
 ## Deployment
 
@@ -140,7 +183,7 @@ For production, use `nohup` or systemd user unit:
 nohup tequila-mule start > ~/.tequila-mule/logs/gateway.log 2>&1 &
 ```
 
-The gateway is designed to run as a persistent process on the login node. On restart, it rehydrates job state from `~/.tequila-mule/state.json` and resumes normal operation.
+The gateway is designed to run as a persistent process on the login node. On restart, it rehydrates each backend pool's job state from its own `~/.tequila-mule/state-<pool-name>.json` and resumes normal operation. (A pool named `"default"` — the legacy single-model shape — falls back to the older `~/.tequila-mule/state.json` if its own state file doesn't exist yet, so upgrading an existing single-model deployment in place doesn't lose track of an already-running job.)
 
 ## Development
 
@@ -160,8 +203,8 @@ ruff check tequila_mule/
 
 ## Limitations (v1)
 
-- Single model per gateway instance (run multiple instances on different ports to serve multiple models)
-- Single shared API key (suitable for research teams, not multi-tenant scenarios)
+- Aliases are static: fixed in the TOML, changed only by editing config and restarting (no runtime alias re-pointing/blue-green model swaps)
+- Single shared API key set across all backend pools (suitable for research teams, not per-model or multi-tenant access control)
 - Slurm only (abstraction layer designed for future SGE/PBS support)
 - No web UI
 

@@ -1,22 +1,19 @@
 # tequila-mule configuration
 # Copy to ~/.tequila-mule/tequila-mule.toml and customize
+#
+# Two supported shapes:
+#   1. Legacy single-model shape: top-level [slurm] + [model] tables.
+#      Automatically migrated at load time into one backend pool named
+#      "default". Existing deployments do not need to change anything.
+#   2. Multi-model shape: one or more [[backends]] entries, each with its
+#      own [backends.slurm] + [backends.model] and optional aliases.
+#      Clients route to a backend by sending its canonical model name or
+#      any of its aliases in the `model` field.
 
 [gateway]
 host = "127.0.0.1"
 port = 8765
 # Auth is enabled via API keys. Run: tequila-mule add-key <email>
-
-[slurm]
-partition = "gpu"
-gres = "gpu:h100:2"
-gpus_per_job = 2
-wall_time = "23:00:00"
-lead_time_minutes = 90
-port = 50000
-
-[model]
-name = "meta-llama/Llama-3.1-8B"
-vllm_extra_args = "--tensor-parallel-size 2 --gpu-memory-utilization 0.95"
 
 [paths]
 container_path = "/home/user/containers/vllm-openai.sif"
@@ -24,3 +21,49 @@ job_template = "tequila_mule/templates/vllm_job.sh.j2"
 state_file = "~/.tequila-mule/state.json"
 log_dir = "~/.tequila-mule/logs"
 api_keys_file = "~/.tequila-mule/api_keys.json"
+
+# --- Legacy single-model shape (still supported) ---
+# [slurm]
+# partition = "gpu"
+# gres = "gpu:h100:2"
+# gpus_per_job = 2
+# wall_time = "23:00:00"
+# lead_time_minutes = 90
+# port = 50000
+#
+# [model]
+# name = "meta-llama/Llama-3.1-8B"
+# vllm_extra_args = "--tensor-parallel-size 2 --gpu-memory-utilization 0.95"
+
+# --- Multi-model shape ---
+[[backends]]
+name = "llama-3.3-70b"
+aliases = ["llama", "default"]
+
+[backends.slurm]
+partition = "gpu"
+gres = "gpu:h100:2"
+gpus_per_job = 2
+wall_time = "23:00:00"
+lead_time_minutes = 90
+port = 50000
+
+[backends.model]
+name = "meta-llama/Llama-3.1-8B"
+vllm_extra_args = "--tensor-parallel-size 2 --gpu-memory-utilization 0.95"
+
+[[backends]]
+name = "small-model-a"
+aliases = ["small", "fast"]
+
+[backends.slurm]
+partition = "gpu"
+gres = "gpu:h100:1"
+gpus_per_job = 1
+wall_time = "23:00:00"
+lead_time_minutes = 90
+port = 50001
+
+[backends.model]
+name = "microsoft/Phi-3.5-mini-instruct"
+vllm_extra_args = "--tensor-parallel-size 1 --max-model-len 8192"

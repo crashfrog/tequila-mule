@@ -11,7 +11,7 @@ from typing import Optional
 
 from jinja2 import Environment, FileSystemLoader
 
-from .config import Config
+from .config import BackendPoolConfig, PathsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +29,34 @@ class JobState:
     backend_url: Optional[str] = None
 
 
-class LifecycleManager:
-    """Manage Slurm job submission and rotation."""
+def _parse_wall_time(wall_time: str) -> timedelta:
+    """Parse wall_time (HH:MM:SS or D-HH:MM:SS) into a timedelta."""
+    if "-" in wall_time:
+        days_str, time_str = wall_time.split("-")
+        days = int(days_str)
+        h, m, s = map(int, time_str.split(":"))
+        return timedelta(days=days, hours=h, minutes=m, seconds=s)
 
-    def __init__(self, config: Config, gateway: "Gateway") -> None:  # type: ignore
-        self.config = config
+    h, m, s = map(int, wall_time.split(":"))
+    return timedelta(hours=h, minutes=m, seconds=s)
+
+
+class LifecycleManager:
+    """Manage Slurm job submission and rotation for a single backend pool."""
+
+    def __init__(
+        self,
+        backend_config: BackendPoolConfig,
+        paths: PathsConfig,
+        gateway_host: str,
+        gateway_port: int,
+        gateway: "Gateway",  # type: ignore
+    ) -> None:
+        self.name = backend_config.name
+        self.backend_config = backend_config
+        self.paths = paths
+        self.gateway_host = gateway_host
+        self.gateway_port = gateway_port
         self.gateway = gateway
         self.current_job: Optional[JobState] = None
         self.pending_job: Optional[JobState] = None
@@ -41,33 +64,48 @@ class LifecycleManager:
         self.task: Optional[asyncio.Task] = None
 
         # Setup Jinja2 for job template rendering
-        template_dir = Path(config.paths.job_template).parent
+        template_dir = Path(paths.job_template).parent
         self.jinja_env = Environment(loader=FileSystemLoader(template_dir))
-        self.template_name = Path(config.paths.job_template).name
+        self.template_name = Path(paths.job_template).name
 
-        # State file path
-        self.state_file = Path(config.paths.state_file).expanduser()
+        # Per-backend state file, e.g. ~/.tequila-mule/state-default.json
+        self.state_file = Path(paths.state_file).expanduser().with_name(
+            f"state-{self.name}.json"
+        )
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Legacy single-backend state file, used as a one-time migration
+        # fallback so an in-place upgrade of an existing "default" backend
+        # doesn't lose track of an already-running job.
+        self._legacy_state_file = Path(paths.state_file).expanduser()
 
     def _load_state(self) -> None:
         """Load state from disk."""
-        if not self.state_file.exists():
-            return
+        state_file = self.state_file
+        if not state_file.exists():
+            if self.name == "default" and self._legacy_state_file.exists():
+                logger.info(
+                    f"No {state_file} found; migrating legacy state from "
+                    f"{self._legacy_state_file}"
+                )
+                state_file = self._legacy_state_file
+            else:
+                return
 
         try:
-            with open(self.state_file) as f:
+            with open(state_file) as f:
                 data = json.load(f)
 
             if data.get("current_job"):
                 self.current_job = JobState(**data["current_job"])
-                logger.info(f"Loaded current job: {self.current_job.job_id}")
+                logger.info(f"[{self.name}] Loaded current job: {self.current_job.job_id}")
 
             if data.get("pending_job"):
                 self.pending_job = JobState(**data["pending_job"])
-                logger.info(f"Loaded pending job: {self.pending_job.job_id}")
+                logger.info(f"[{self.name}] Loaded pending job: {self.pending_job.job_id}")
 
         except Exception as e:
-            logger.error(f"Failed to load state: {e}")
+            logger.error(f"[{self.name}] Failed to load state: {e}")
 
     def _save_state(self) -> None:
         """Save state to disk."""
@@ -85,42 +123,31 @@ class LifecycleManager:
             tmp_file.replace(self.state_file)
 
         except Exception as e:
-            logger.error(f"Failed to save state: {e}")
+            logger.error(f"[{self.name}] Failed to save state: {e}")
 
     def _submit_job(self) -> str:
         """Submit a new Slurm job. Returns job_id."""
-        # Calculate expiry time
         submitted_at = datetime.utcnow()
-
-        # Parse wall_time (supports HH:MM:SS or D-HH:MM:SS)
-        wall_time = self.config.slurm.wall_time
-        if "-" in wall_time:
-            days_str, time_str = wall_time.split("-")
-            days = int(days_str)
-            h, m, s = map(int, time_str.split(":"))
-            duration = timedelta(days=days, hours=h, minutes=m, seconds=s)
-        else:
-            h, m, s = map(int, wall_time.split(":"))
-            duration = timedelta(hours=h, minutes=m, seconds=s)
-
-        expires_at = submitted_at + duration
+        duration = _parse_wall_time(self.backend_config.slurm.wall_time)
+        expires_at = submitted_at + duration  # noqa: F841 (kept for parity/clarity)
 
         # Render job script
         template = self.jinja_env.get_template(self.template_name)
         script = template.render(
-            partition=self.config.slurm.partition,
-            gres=self.config.slurm.gres,
-            wall_time=self.config.slurm.wall_time,
-            container_path=self.config.paths.container_path,
-            model_name=self.config.model.name,
-            vllm_port=self.config.slurm.port,
-            vllm_extra_args=self.config.model.vllm_extra_args,
-            gateway_host="reedling2.fda.gov",
-            gateway_port=self.config.gateway.port,
+            partition=self.backend_config.slurm.partition,
+            gres=self.backend_config.slurm.gres,
+            wall_time=self.backend_config.slurm.wall_time,
+            container_path=self.paths.container_path,
+            model_name=self.backend_config.model.name,
+            vllm_port=self.backend_config.slurm.port,
+            vllm_extra_args=self.backend_config.model.vllm_extra_args,
+            backend_name=self.name,
+            gateway_host=self.gateway_host,
+            gateway_port=self.gateway_port,
         )
 
         # Submit via sbatch
-        logger.info("Submitting Slurm job")
+        logger.info(f"[{self.name}] Submitting Slurm job")
         result = subprocess.run(
             ["sbatch", "--parsable"],
             input=script.encode(),
@@ -128,7 +155,7 @@ class LifecycleManager:
             check=True,
         )
         job_id = result.stdout.decode().strip()
-        logger.info(f"Job submitted: {job_id}")
+        logger.info(f"[{self.name}] Job submitted: {job_id}")
 
         return job_id
 
@@ -162,8 +189,19 @@ class LifecycleManager:
         if self.current_job:
             info = self._get_job_info(self.current_job.job_id)
             if not info or info["state"] not in ("RUNNING", "PENDING"):
-                logger.warning(f"Current job {self.current_job.job_id} no longer valid")
+                logger.warning(
+                    f"[{self.name}] Current job {self.current_job.job_id} no longer valid"
+                )
                 self.current_job = None
+            elif self.current_job.backend_url:
+                # Rehydrate the gateway's registry so a restart doesn't briefly
+                # 503 requests for an already-running backend.
+                await self.gateway.set_backend(
+                    self.name,
+                    self.current_job.backend_url,
+                    model_name=self.backend_config.model.name,
+                    job_id=self.current_job.job_id,
+                )
 
         # Cold start: submit job immediately if no current job.
         # Run as a background task so uvicorn finishes startup and can
@@ -172,7 +210,7 @@ class LifecycleManager:
             asyncio.create_task(self._cold_start())
 
         self.task = asyncio.create_task(self._rotation_loop())
-        logger.info("Lifecycle manager started")
+        logger.info(f"[{self.name}] Lifecycle manager started")
 
     async def stop(self) -> None:
         """Stop lifecycle manager."""
@@ -183,32 +221,21 @@ class LifecycleManager:
                 await self.task
             except asyncio.CancelledError:
                 pass
-        logger.info("Lifecycle manager stopped")
+        logger.info(f"[{self.name}] Lifecycle manager stopped")
 
     async def _cold_start(self) -> None:
         """Handle cold start - no current job."""
-        logger.info("Cold start: submitting initial job")
+        logger.info(f"[{self.name}] Cold start: submitting initial job")
 
         job_id = self._submit_job()
         submitted_at = datetime.utcnow()
-
-        # Calculate expiry
-        wall_time = self.config.slurm.wall_time
-        if "-" in wall_time:
-            days_str, time_str = wall_time.split("-")
-            days = int(days_str)
-            h, m, s = map(int, time_str.split(":"))
-            duration = timedelta(days=days, hours=h, minutes=m, seconds=s)
-        else:
-            h, m, s = map(int, wall_time.split(":"))
-            duration = timedelta(hours=h, minutes=m, seconds=s)
-
+        duration = _parse_wall_time(self.backend_config.slurm.wall_time)
         expires_at = submitted_at + duration
 
         self.pending_job = JobState(
             job_id=job_id,
             node=None,
-            port=self.config.slurm.port,
+            port=self.backend_config.slurm.port,
             status="PENDING",
             submitted_at=submitted_at.isoformat(),
             expires_at=expires_at.isoformat(),
@@ -220,13 +247,13 @@ class LifecycleManager:
 
     async def _wait_for_job_ready(self, job: JobState) -> None:
         """Wait for job to reach RUNNING and register with gateway."""
-        logger.info(f"Waiting for job {job.job_id} to become ready")
+        logger.info(f"[{self.name}] Waiting for job {job.job_id} to become ready")
 
         # Poll until RUNNING
         while self.running:
             info = self._get_job_info(job.job_id)
             if not info:
-                logger.error(f"Job {job.job_id} disappeared from queue")
+                logger.error(f"[{self.name}] Job {job.job_id} disappeared from queue")
                 job.status = "FAILED"
                 self._save_state()
                 return
@@ -235,25 +262,24 @@ class LifecycleManager:
                 job.status = "RUNNING"
                 job.node = info["node"]
                 job.backend_url = f"http://{job.node}:{job.port}"
-                logger.info(f"Job {job.job_id} running on {job.node}")
+                logger.info(f"[{self.name}] Job {job.job_id} running on {job.node}")
                 break
 
             await asyncio.sleep(5)
 
         # Job is running, wait for registration (up to 5 min)
-        # Gateway's /internal/register will set current_backend
-        # We just wait and check if it matches our expectation
+        # Gateway's /internal/register will set the backend for this pool.
         start_time = datetime.utcnow()
         while self.running:
             if (datetime.utcnow() - start_time).total_seconds() > 300:
-                logger.error(f"Job {job.job_id} failed to register within 5 minutes")
+                logger.error(f"[{self.name}] Job {job.job_id} failed to register within 5 minutes")
                 job.status = "FAILED"
                 self._save_state()
                 return
 
             # Check if gateway backend matches our job
-            if self.gateway.current_backend == job.backend_url:
-                logger.info(f"Job {job.job_id} registered successfully")
+            if self.gateway.get_backend(self.name) == job.backend_url:
+                logger.info(f"[{self.name}] Job {job.job_id} registered successfully")
 
                 # Promote pending → current
                 self.current_job = job
@@ -272,33 +298,23 @@ class LifecycleManager:
 
             # Calculate time until rotation needed
             expires_at = datetime.fromisoformat(self.current_job.expires_at)
-            lead_time = timedelta(minutes=self.config.slurm.lead_time_minutes)
+            lead_time = timedelta(minutes=self.backend_config.slurm.lead_time_minutes)
             rotation_time = expires_at - lead_time
 
             now = datetime.utcnow()
             if now >= rotation_time and not self.pending_job:
                 # Submit next job
-                logger.info("Rotation window reached, submitting next job")
+                logger.info(f"[{self.name}] Rotation window reached, submitting next job")
 
                 job_id = self._submit_job()
                 submitted_at = datetime.utcnow()
-
-                wall_time = self.config.slurm.wall_time
-                if "-" in wall_time:
-                    days_str, time_str = wall_time.split("-")
-                    days = int(days_str)
-                    h, m, s = map(int, time_str.split(":"))
-                    duration = timedelta(days=days, hours=h, minutes=m, seconds=s)
-                else:
-                    h, m, s = map(int, wall_time.split(":"))
-                    duration = timedelta(hours=h, minutes=m, seconds=s)
-
+                duration = _parse_wall_time(self.backend_config.slurm.wall_time)
                 expires_at_new = submitted_at + duration
 
                 self.pending_job = JobState(
                     job_id=job_id,
                     node=None,
-                    port=self.config.slurm.port,
+                    port=self.backend_config.slurm.port,
                     status="PENDING",
                     submitted_at=submitted_at.isoformat(),
                     expires_at=expires_at_new.isoformat(),

@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -54,6 +54,15 @@ class ModelConfig(BaseModel):
     vllm_extra_args: str = "--tensor-parallel-size 2 --gpu-memory-utilization 0.95"
 
 
+class BackendPoolConfig(BaseModel):
+    """A single rotating backend pool: one Slurm job lineage serving one model."""
+
+    name: str
+    model: ModelConfig = Field(default_factory=ModelConfig)
+    slurm: SlurmConfig = Field(default_factory=SlurmConfig)
+    aliases: list[str] = Field(default_factory=list)
+
+
 class PathsConfig(BaseModel):
     """Path configuration."""
 
@@ -68,9 +77,43 @@ class Config(BaseModel):
     """Root configuration."""
 
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    paths: PathsConfig = Field(default_factory=PathsConfig)
+    backends: list[BackendPoolConfig] = Field(default_factory=list)
+
+    # Legacy singular fields. Only used to migrate old-style single-model
+    # TOML (no [[backends]]) into a single "default" backend pool so
+    # existing deployments don't need to change their config file.
     slurm: SlurmConfig = Field(default_factory=SlurmConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
-    paths: PathsConfig = Field(default_factory=PathsConfig)
+
+    @model_validator(mode="after")
+    def _migrate_legacy_shape(self) -> "Config":
+        """Synthesize a single "default" backend pool from legacy [slurm]/[model]
+        tables when no [[backends]] entries are configured."""
+        if not self.backends:
+            self.backends = [
+                BackendPoolConfig(name="default", model=self.model, slurm=self.slurm)
+            ]
+        return self
+
+    @model_validator(mode="after")
+    def _validate_backends(self) -> "Config":
+        names = [b.name for b in self.backends]
+        if len(names) != len(set(names)):
+            raise ValueError("Backend pool names must be unique")
+
+        aliases = [alias for b in self.backends for alias in b.aliases]
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("Backend aliases must be unique across all backends")
+
+        reserved = set(names) | {b.model.name for b in self.backends}
+        collisions = set(aliases) & reserved
+        if collisions:
+            raise ValueError(
+                f"Aliases must not collide with a backend name or model name: {collisions}"
+            )
+
+        return self
 
 
 def load_config(config_path: Optional[Path] = None) -> Config:

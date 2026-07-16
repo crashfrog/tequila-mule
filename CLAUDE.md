@@ -51,25 +51,27 @@ tequila-mule/
 
 ## Architecture Overview
 
-The system has three core moving parts:
+The gateway hosts one or more independently-rotating **backend pools** (e.g. a large model on multiple GPUs plus small models on single GPUs), each configured as a `[[backends]]` entry with its own name, Slurm sizing, model, and optional aliases. The `Gateway` maintains a static routing table (canonical name + model name + aliases → backend pool name) built once at startup, and a per-pool registry of live backend URLs. For each configured pool there is one `LifecycleManager` and one `HealthMonitor` instance — they don't share state, so one pool rotating, cold-starting, or failing never blocks another. Legacy single-model configs (top-level `[slurm]`/`[model]`, no `[[backends]]`) are migrated at config-load time into a single pool named `"default"`.
 
 1. **Gateway** (FastAPI process on login node)
    - OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, `/v1/models` endpoints
-   - Maintains reference to current active backend, proxies requests via httpx with streaming
-   - Exposes internal registration endpoint (`POST /internal/register`) for backends to announce themselves
-   - Queues or retries requests during backend rotation (configurable window, default 30s)
+   - Resolves the target backend pool from the request's `model` field (exact canonical name or alias); unknown models get `400`
+   - Rewrites the outgoing `model` field to the resolved pool's actual served model name before proxying via httpx (with streaming)
+   - Exposes internal registration endpoint (`POST /internal/register`) for backends to announce themselves — the registration payload must include `backend_name` identifying which pool is registering
+   - `GET /v1/models` lists canonical model names and aliases for every currently-live pool
 
-2. **Lifecycle Manager** (background thread in gateway)
+2. **Lifecycle Manager** (one instance per backend pool, background task in gateway)
    - Tracks job state: `{job_id, node, port, status, submitted_at, expires_at}`
    - Submits new Slurm job at `wall_time - lead_time` before current job expiry
    - Polls `squeue`/`scontrol` until new job reaches `RUNNING`
-   - Waits for registration callback from new job (with polling fallback)
-   - Atomically swaps active backend once new job passes health check
+   - Waits for registration callback from new job (matched by backend pool name)
+   - Atomically swaps that pool's active backend once new job passes health check
    - On cold start: submits immediately and blocks until backend is available
+   - Persists state to its own `state-<pool-name>.json`; a `"default"` pool falls back to reading the legacy `state.json` on first load if its own file doesn't exist yet (in-place upgrade path)
 
-3. **Health Monitor** (background thread in gateway)
-   - Periodically polls `GET /health` on active backend
-   - On failure: marks unhealthy, triggers emergency lifecycle check
+3. **Health Monitor** (one instance per backend pool, background task in gateway)
+   - Periodically polls `GET /health` on that pool's active backend
+   - On failure: marks unhealthy, triggers emergency lifecycle check for that pool only
    - Distinguishes between unreachable node vs. slow backend
 
 **Job rotation timeline example:**
@@ -158,27 +160,28 @@ The gateway reads `tequila-mule.toml` from the current directory or `~/.tequila-
 
 Key config sections:
 - `[gateway]`: host, port, api_key, request_retry_window_seconds
-- `[slurm]`: partition, gres, wall_time, lead_time_minutes, overlap_jobs, port_range
-- `[model]`: name, vllm_extra_args
+- `[[backends]]`: one entry per model pool — `name`, `aliases`, `[backends.slurm]` (partition, gres, wall_time, lead_time_minutes, port), `[backends.model]` (name, vllm_extra_args)
 - `[paths]`: job_template, state_file, log_dir
+- Legacy top-level `[slurm]`/`[model]` tables (no `[[backends]]`) are still accepted and migrated into a single `"default"` pool
 
 ## Key Implementation Details
 
 ### State Persistence
-- Job state stored in `~/.tequila-mule/state.json` (configurable)
-- On gateway restart, lifecycle re-checks `squeue` to rehydrate and validate
-- If all jobs are dead, gateway cold-starts
+- Each backend pool's job state stored in its own `~/.tequila-mule/state-<pool-name>.json` (configurable base path)
+- A `"default"` pool (legacy single-model config) falls back to the old shared `~/.tequila-mule/state.json` if its per-pool file doesn't exist yet — zero-downtime migration path for existing deployments
+- On gateway restart, each pool's lifecycle manager independently re-checks `squeue` to rehydrate and validate
+- If a pool's job is dead, that pool cold-starts independently of the others
 
 ### Slurm Job Submission
-- Template: `tequila_mule/templates/vllm_job.sh.j2`
-- Rendered with live parameters (job_id, port, model, api_key for internal comms)
-- Job posts to gateway `/internal/register` once vLLM is accepting requests
+- Template: `tequila_mule/templates/vllm_job.sh.j2` (shared across all backend pools; differentiated purely by Jinja variables — gres, model, args, port, backend_name)
+- Rendered with live parameters (job_id, port, model, backend_name)
+- Job posts to gateway `/internal/register` once vLLM is accepting requests, including `backend_name` so the gateway knows which pool is registering
 - Job traps `SIGTERM` to post to `/internal/deregister` before expiry
 
 ### Backend Registration & Health
-- Registration endpoint is internal-only (no auth check; assumes login-node-only access)
-- Health monitor distinguishes "unreachable" (node died) vs. "slow" (under load)
-- Failed health checks trigger emergency checks in lifecycle manager
+- Registration endpoint is internal-only (no auth check; assumes login-node-only access); requires `backend_name` to match a configured pool or the registration is rejected with `400`
+- Health monitor distinguishes "unreachable" (node died) vs. "slow" (under load), scoped to a single backend pool
+- Failed health checks trigger emergency checks in that pool's lifecycle manager only
 
 ### Async Request Handling
 - All request proxying is async via httpx
@@ -218,6 +221,6 @@ Or as systemd user unit if environment supports `loginctl enable-linger`.
 ## Future Extensions (Out of Scope v1)
 
 - SGE/PBS support (job submission abstraction is designed for swapping)
-- Multi-model routing (run multiple gateway instances on different ports as workaround)
+- Dynamic/runtime alias re-pointing (aliases are currently static, fixed in TOML until restart — no Bedrock-style hot model-version swaps under a stable alias)
 - Autoscaling (submit additional jobs under load—natural extension of lifecycle manager)
 - Web dashboard (`tequila-mule status --web` for HTML status page)

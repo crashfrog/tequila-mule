@@ -27,6 +27,7 @@ VLLM_PORT="{{ vllm_port }}"
 VLLM_HOST="0.0.0.0"
 MODEL_NAME="{{ model_name }}"
 CONTAINER="{{ container_path }}"
+BACKEND_NAME="{{ backend_name }}"
 
 # Gateway registration details
 GATEWAY_HOST="{{ gateway_host }}"
@@ -74,7 +75,9 @@ REGISTER_PAYLOAD=$(cat <<EOF
 {
   "job_id": "${SLURM_JOB_ID}",
   "node": "${NODE}",
-  "port": ${VLLM_PORT}
+  "port": ${VLLM_PORT},
+  "backend_name": "${BACKEND_NAME}",
+  "model_name": "${MODEL_NAME}"
 }
 EOF
 )
