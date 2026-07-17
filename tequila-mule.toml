@@ -16,7 +16,7 @@ port = 8765
 # Auth is enabled via API keys. Run: tequila-mule add-key <email>
 
 [paths]
-container_path = "/home/user/containers/vllm-openai.sif"
+container_path = "~/.tequila-mule/containers/vllm-openai.sif"
 job_template = "tequila_mule/templates/vllm_job.sh.j2"
 state_file = "~/.tequila-mule/state.json"
 log_dir = "~/.tequila-mule/logs"
@@ -36,9 +36,16 @@ api_keys_file = "~/.tequila-mule/api_keys.json"
 # vllm_extra_args = "--tensor-parallel-size 2 --gpu-memory-utilization 0.95"
 
 # --- Multi-model shape ---
+
+# Large, Opus-like pool: Llama 3.3 70B served in FP8 across both H100s.
+# FP8 weights (~71GB) leave real VRAM headroom for the KV cache, unlike BF16
+# (~142GB) which would starve concurrency. Weights stay entirely in VRAM — do
+# NOT use --cpu-offload-gb here (it streams weights over PCIe per token and
+# throttles decode). Prefix caching is on; add KV-cache RAM spillover only if
+# eviction shows up under load.
 [[backends]]
 name = "llama-3.3-70b"
-aliases = ["llama", "default"]
+aliases = ["llama", "large", "default"]
 
 [backends.slurm]
 partition = "gpu"
@@ -49,11 +56,14 @@ lead_time_minutes = 90
 port = 50000
 
 [backends.model]
-name = "meta-llama/Llama-3.1-8B"
-vllm_extra_args = "--tensor-parallel-size 2 --gpu-memory-utilization 0.95"
+name = "meta-llama/Llama-3.3-70B-Instruct-FP8"
+vllm_extra_args = "--tensor-parallel-size 2 --gpu-memory-utilization 0.95 --enable-prefix-caching"
 
+# Small, fast pool for low-complexity / subagent work: Gemma 3 12B (Google, US
+# origin). ~24GB BF16 next to an 80GB H100 leaves plenty of room for a large
+# prefix cache; no RAM offload needed.
 [[backends]]
-name = "small-model-a"
+name = "gemma-3-12b"
 aliases = ["small", "fast"]
 
 [backends.slurm]
@@ -65,5 +75,5 @@ lead_time_minutes = 90
 port = 50001
 
 [backends.model]
-name = "microsoft/Phi-3.5-mini-instruct"
-vllm_extra_args = "--tensor-parallel-size 1 --max-model-len 8192"
+name = "google/gemma-3-12b-it"
+vllm_extra_args = "--tensor-parallel-size 1 --max-model-len 8192 --enable-prefix-caching"

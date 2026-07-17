@@ -66,7 +66,7 @@ class BackendPoolConfig(BaseModel):
 class PathsConfig(BaseModel):
     """Path configuration."""
 
-    container_path: str = "/home/user/containers/vllm-openai.sif"
+    container_path: str = "~/.tequila-mule/containers/vllm-openai.sif"
     job_template: str = "tequila_mule/templates/vllm_job.sh.j2"
     state_file: str = "~/.tequila-mule/state.json"
     log_dir: str = "~/.tequila-mule/logs"

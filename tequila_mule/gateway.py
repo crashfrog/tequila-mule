@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
@@ -224,14 +225,46 @@ class Gateway:
         for every currently-registered (live) backend."""
         await self._check_auth(request)
 
+        created = int(time.time())
+
+        def model_obj(model_id: str, root: str) -> dict:
+            # Full OpenAI-compatible model object. Some harnesses validate
+            # strictly against this schema, so we populate every standard field
+            # (created/owned_by/root/parent/permission) rather than the bare
+            # id/object pair. `root` links an alias back to the served model.
+            return {
+                "id": model_id,
+                "object": "model",
+                "created": created,
+                "owned_by": "tequila-mule",
+                "root": root,
+                "parent": None if model_id == root else root,
+                "permission": [
+                    {
+                        "id": f"modelperm-{model_id}",
+                        "object": "model_permission",
+                        "created": created,
+                        "allow_create_engine": False,
+                        "allow_sampling": True,
+                        "allow_logprobs": True,
+                        "allow_search_indices": False,
+                        "allow_view": True,
+                        "allow_fine_tuning": False,
+                        "organization": "*",
+                        "group": None,
+                        "is_blocking": False,
+                    }
+                ],
+            }
+
         data = []
         for backend in self.config.backends:
             entry = self.backends.get(backend.name)
             if not entry:
                 continue  # pool has no live job yet; don't advertise it
-            data.append({"id": entry.model_name, "object": "model", "owned_by": "tequila-mule"})
+            data.append(model_obj(entry.model_name, entry.model_name))
             for alias in backend.aliases:
-                data.append({"id": alias, "object": "model", "owned_by": "tequila-mule"})
+                data.append(model_obj(alias, entry.model_name))
 
         if not data:
             raise HTTPException(

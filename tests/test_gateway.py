@@ -240,3 +240,29 @@ async def test_models_endpoint_lists_aliases(multi_gateway):
     # not live yet, must not be advertised
     assert "small" not in ids
     assert "Qwen2.5-Coder-7B-Instruct" not in ids
+
+
+@pytest.mark.asyncio
+async def test_models_endpoint_returns_full_openai_schema(multi_gateway):
+    """Each model object must carry the full OpenAI schema so strict harnesses
+    (OpenCode, Pi) can parse it. Aliases point back at the served model via root."""
+    await multi_gateway.set_backend(
+        "llama-3.3-70b", "http://llama-node:50000", model_name="meta-llama/Llama-3.3-70B-Instruct"
+    )
+
+    client = TestClient(multi_gateway.app)
+    data = client.get("/v1/models").json()["data"]
+    by_id = {entry["id"]: entry for entry in data}
+
+    canonical = by_id["meta-llama/Llama-3.3-70B-Instruct"]
+    for field in ("object", "created", "owned_by", "root", "parent", "permission"):
+        assert field in canonical
+    assert canonical["object"] == "model"
+    assert canonical["root"] == "meta-llama/Llama-3.3-70B-Instruct"
+    assert canonical["parent"] is None
+    assert isinstance(canonical["permission"], list) and canonical["permission"]
+
+    # An alias resolves to the same served model and declares it as its root/parent.
+    alias = by_id["llama"]
+    assert alias["root"] == "meta-llama/Llama-3.3-70B-Instruct"
+    assert alias["parent"] == "meta-llama/Llama-3.3-70B-Instruct"

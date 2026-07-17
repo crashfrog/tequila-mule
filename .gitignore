@@ -44,5 +44,12 @@ state.json
 .env
 .env.local
 
-# Internal HPC docs (site-specific, do not commit)
+# Internal / site-specific HPC artifacts (contain internal hostnames, usernames,
+# and paths — do not commit to the public repo)
 REEDLING.md
+REEDLING_DEPLOYMENT.md
+tequila-mule-reedling.toml
+tequila-mule-reedling-fixed.toml
+vllm_job_reedling.sh.j2
+deploy_to_reedling.sh
+finish_deployment.sh

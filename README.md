@@ -86,7 +86,7 @@ cp tequila-mule.toml ~/.tequila-mule/
 # Edit ~/.tequila-mule/tequila-mule.toml with your partition, wall-time, model, etc.
 ```
 
-### First-Time Setup (Reedling HPC)
+### First-Time Setup (air-gapped clusters)
 
 If running on air-gapped compute nodes, pre-stage container and model weights:
 
@@ -176,6 +176,14 @@ See `tequila-mule.toml` for all options. Key sections:
 Legacy top-level `[slurm]`/`[model]` tables (no `[[backends]]`) are still supported and are migrated automatically into a single `"default"` backend pool.
 
 ## Deployment
+
+**Deploying on a new cluster?** Start with **[AGENTS.md](AGENTS.md)** — a
+cluster-agnostic deployment guide written for an agent or engineer bringing
+tequila-mule up on a grid it wasn't built for. It walks the filesystem/bind-mount,
+container-version, model-fit, and connectivity gotchas in order, with a
+failure→cause quick reference. (Site operators may keep a private,
+cluster-specific companion doc with already-solved values for their own grid;
+such files are gitignored and not part of this public repo.)
 
 For production, use `nohup` or systemd user unit:
 

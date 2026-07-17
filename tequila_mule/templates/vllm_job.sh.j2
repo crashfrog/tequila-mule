@@ -38,10 +38,16 @@ echo "Model: ${MODEL_NAME}"
 echo "Container: ${CONTAINER}"
 echo "vLLM will bind to ${VLLM_HOST}:${VLLM_PORT}"
 
-# Start vLLM server in Singularity container
+# Start vLLM server in Singularity container.
+# --bind {{ bind_path | default('/nfs') }}: the model weights and container live
+#   on the cluster scratch filesystem, which Singularity does NOT auto-mount;
+#   without this the container reports "Incorrect path_or_model_id".
+# We invoke the OpenAI API server module directly rather than the `vllm` CLI
+#   shim, which is not reliably on PATH inside the container on compute nodes.
 echo "Starting vLLM server..."
-singularity exec --nv "${CONTAINER}" \
-    vllm serve "${MODEL_NAME}" \
+singularity exec --nv --bind {{ bind_path | default('/nfs') }} "${CONTAINER}" \
+    python3 -m vllm.entrypoints.openai.api_server \
+    --model "${MODEL_NAME}" \
     --host "${VLLM_HOST}" \
     --port "${VLLM_PORT}" \
     {{ vllm_extra_args }} &
