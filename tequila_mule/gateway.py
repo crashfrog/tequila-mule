@@ -17,7 +17,13 @@ from .keystore import KeyStore
 
 logger = logging.getLogger(__name__)
 
-_UNSUPPORTED = {"tools", "tool_choice", "store", "parallel_tool_calls", "stream_options"}
+# `store` and `stream_options` are OpenAI-only/streaming-usage fields the
+# backend chat-completions endpoint rejects with 400s; `tools`/`tool_choice`/
+# `parallel_tool_calls` are supported by the fleet's vLLM build
+# (--enable-auto-tool-choice --tool-call-parser poolside_v1) and MUST reach
+# the backend, or vLLM never activates its tool-call parser and the model's
+# tool calls fall through as raw unparsed text in the response content.
+_UNSUPPORTED = {"store", "stream_options"}
 
 
 @dataclass
@@ -68,6 +74,11 @@ class Gateway:
         """Return the URL currently registered for a backend pool, if any."""
         entry = self.backends.get(backend_name)
         return entry.url if entry else None
+
+    def get_backend_job_id(self, backend_name: str) -> Optional[str]:
+        """Return the job_id of the backend currently registered for a pool, if any."""
+        entry = self.backends.get(backend_name)
+        return entry.job_id if entry else None
 
     async def set_backend(
         self, backend_name: str, backend_url: str, model_name: str = "", job_id: str = ""
@@ -130,9 +141,9 @@ class Gateway:
 
         url = f"{entry.url}{endpoint}"
         # Rewrite the model field to the backend's actual served model name so
-        # clients can use a canonical name or alias. Also strip fields vLLM
-        # 0.4.x doesn't support (tools, tool_choice, store, etc.) to avoid
-        # 400 validation errors.
+        # clients can use a canonical name or alias. Also strip OpenAI fields
+        # the backend chat-completions endpoint has no use for (see
+        # _UNSUPPORTED) to avoid 400 validation errors.
         body_json["model"] = entry.model_name
         for key in _UNSUPPORTED:
             body_json.pop(key, None)

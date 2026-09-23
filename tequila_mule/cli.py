@@ -2,6 +2,7 @@
 
 import glob
 import logging
+import socket
 import sys
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -34,13 +35,29 @@ class GatewayServer:
             lifecycle_manager = LifecycleManager(
                 backend,
                 config.paths,
-                config.gateway.host,
+                self._advertise_host(config),
                 config.gateway.port,
                 self.gateway,
             )
 
             self.health_monitors[backend.name] = health_monitor
             self.lifecycle_managers[backend.name] = lifecycle_manager
+
+    @staticmethod
+    def _advertise_host(config: Config) -> str:
+        """Resolve the hostname compute nodes use to reach this gateway.
+
+        `config.gateway.host` is the uvicorn bind address, commonly
+        "0.0.0.0" or "::" (bind all interfaces) — not something a compute
+        node can dial back to for /internal/register. Prefer an explicit
+        `advertise_host`; otherwise fall back to the machine's real hostname
+        when the bind address is bind-all, or reuse the bind host itself.
+        """
+        if config.gateway.advertise_host:
+            return config.gateway.advertise_host
+        if config.gateway.host in ("0.0.0.0", "::"):
+            return socket.gethostname()
+        return config.gateway.host
 
     def _make_unhealthy_callback(self, backend_name: str) -> Callable[[], Awaitable[None]]:
         """Build a per-backend callback for health monitor failures."""
