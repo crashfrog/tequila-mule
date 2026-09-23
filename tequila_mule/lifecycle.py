@@ -144,6 +144,9 @@ class LifecycleManager:
             backend_name=self.name,
             gateway_host=self.gateway_host,
             gateway_port=self.gateway_port,
+            memory=self.backend_config.slurm.memory,
+            cpus_per_task=self.backend_config.slurm.cpus_per_task,
+            singularity_env=self.backend_config.model.env,
         )
 
         # Submit via sbatch
@@ -267,18 +270,29 @@ class LifecycleManager:
 
             await asyncio.sleep(5)
 
-        # Job is running, wait for registration (up to 5 min)
+        # Wait for the job to register. Graph-mode (CUDA graphs / torch.compile)
+        # cold starts are slow — first-run compile plus weight load and graph
+        # capture can take ~15 min on a cold compile cache. 5 min was too short
+        # and marked healthy-but-still-compiling jobs FAILED. 20 min matches the
+        # job template's MAX_WAIT. With the compile cache on shared scratch,
+        # steady-state rotations reuse it and register in well under a minute.
         # Gateway's /internal/register will set the backend for this pool.
         start_time = datetime.utcnow()
         while self.running:
-            if (datetime.utcnow() - start_time).total_seconds() > 300:
-                logger.error(f"[{self.name}] Job {job.job_id} failed to register within 5 minutes")
+            if (datetime.utcnow() - start_time).total_seconds() > 1200:
+                logger.error(f"[{self.name}] Job {job.job_id} failed to register within 20 minutes")
                 job.status = "FAILED"
                 self._save_state()
                 return
 
-            # Check if gateway backend matches our job
-            if self.gateway.get_backend(self.name) == job.backend_url:
+            # Check if gateway backend matches our job. Compare by job_id,
+            # not job.backend_url: job.backend_url is built from squeue's
+            # short hostname (%N), while the registered URL comes from the
+            # job's own `hostname` command (often FQDN) — those never
+            # string-match, which silently prevented promotion forever and
+            # caused every gateway restart to cold-start a duplicate job on
+            # top of an already-registered, healthy one.
+            if self.gateway.get_backend_job_id(self.name) == job.job_id:
                 logger.info(f"[{self.name}] Job {job.job_id} registered successfully")
 
                 # Promote pending → current

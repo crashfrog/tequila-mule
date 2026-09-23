@@ -1,12 +1,23 @@
 #!/bin/bash
 #SBATCH --partition={{ partition }}
-#SBATCH --gres={{ gres }}
+{% if memory %}#SBATCH --mem={{ memory }}
+{% endif %}{% if cpus_per_task %}#SBATCH --cpus-per-task={{ cpus_per_task }}
+{% endif %}#SBATCH --gres={{ gres }}
 #SBATCH --time={{ wall_time }}
 #SBATCH --job-name=tequila-mule-vllm
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
 
 set -euo pipefail
+
+# Run from a dedicated per-job scratch directory, never the Slurm submit
+# directory (typically the gateway daemon's home directory). Singularity
+# preserves the host cwd by default, and Python's -m module loader inserts
+# that cwd at the front of sys.path — a stray same-named file there (e.g. an
+# old ad-hoc "inspect.py") silently shadows a stdlib module and breaks vLLM
+# at import time. A fresh empty tmp dir can never collide.
+JOB_WORKDIR="$(mktemp -d)"
+cd "${JOB_WORKDIR}"
 
 # Trap SIGTERM to gracefully deregister before job termination
 trap 'cleanup' TERM INT
@@ -38,6 +49,16 @@ echo "Model: ${MODEL_NAME}"
 echo "Container: ${CONTAINER}"
 echo "vLLM will bind to ${VLLM_HOST}:${VLLM_PORT}"
 
+# Container environment (from [backends.model].env). SINGULARITYENV_ crosses
+# each variable into the container. Build-specific kernel-stability toggles
+# live here rather than being hardcoded, so swapping to a newer vLLM container
+# that fixes a kernel is a config edit, not a template edit. Example:
+#   [backends.model.env]
+#   VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER = "0"  # unstable FP8 GEMM on 0.25.1
+{% for key, value in (singularity_env | default({})).items() %}
+export SINGULARITYENV_{{ key }}="{{ value }}"
+{% endfor %}
+
 # Start vLLM server in Singularity container.
 # --bind {{ bind_path | default('/nfs') }}: the model weights and container live
 #   on the cluster scratch filesystem, which Singularity does NOT auto-mount;
@@ -57,7 +78,12 @@ echo "vLLM PID: ${VLLM_PID}"
 
 # Wait for vLLM to be ready (check /health endpoint)
 echo "Waiting for vLLM to be ready..."
-MAX_WAIT=300  # 5 minutes
+# Graph-mode (CUDA graphs / torch.compile) cold start is slow: first-run
+# torch.compile can take ~2 min plus weight load and graph capture. 5 min was
+# too tight and killed vLLM mid-capture; 20 min gives comfortable margin.
+# With the compile cache redirected to scratch (see [backends.model].env),
+# subsequent starts reuse it and come up far faster.
+MAX_WAIT=1200  # 20 minutes
 ELAPSED=0
 while [ $ELAPSED -lt $MAX_WAIT ]; do
     if curl -s http://localhost:${VLLM_PORT}/health > /dev/null 2>&1; then

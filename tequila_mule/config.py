@@ -17,6 +17,12 @@ class GatewayConfig(BaseModel):
 
     host: str = "127.0.0.1"
     port: int = 8765
+    # Hostname compute nodes use to reach this gateway for /internal/register
+    # callbacks. `host` is the uvicorn bind address and is frequently
+    # "0.0.0.0"/"::" (bind all interfaces) — not a routable address a compute
+    # node can dial. Leave unset to auto-resolve via socket.gethostname() when
+    # `host` is a bind-all address, or reuse `host` otherwise.
+    advertise_host: Optional[str] = None
 
 
 class SlurmConfig(BaseModel):
@@ -28,6 +34,8 @@ class SlurmConfig(BaseModel):
     wall_time: str = "23:00:00"
     lead_time_minutes: int = 90
     port: int = 50000  # Fixed port for vLLM on compute nodes
+    memory: Optional[str] = None  # Slurm --mem, e.g. "128GB"; omitted if unset
+    cpus_per_task: Optional[int] = None  # Slurm --cpus-per-task; omitted if unset
 
     @field_validator("wall_time")
     @classmethod
@@ -52,6 +60,12 @@ class ModelConfig(BaseModel):
 
     name: str = "meta-llama/Llama-3.1-8B"
     vllm_extra_args: str = "--tensor-parallel-size 2 --gpu-memory-utilization 0.95"
+    # Environment variables to set inside the vLLM container, keyed by bare
+    # name (no SINGULARITYENV_ prefix — the template adds it so the value
+    # crosses into Singularity). Use for build-specific kernel-stability
+    # toggles, e.g. {"VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": "0"} to disable an
+    # unstable FP8 GEMM path on a given container. Empty by default.
+    env: dict[str, str] = Field(default_factory=dict)
 
 
 class BackendPoolConfig(BaseModel):
